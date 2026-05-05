@@ -1,4 +1,4 @@
-import { createKafkaClient } from '../../libs/kafka/src/kafka.provider';
+import { createKafkaClient } from '../../../libs/kafka/src/kafka.provider';
 
 function isBlacklisted(userId: string) {
   if (!userId) return false;

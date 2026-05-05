@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2020",
+    "outDir": "dist",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@libs/kafka": ["../../libs/kafka/src/kafka.provider"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "../../libs/kafka/src/**/*"
+  ]
+}

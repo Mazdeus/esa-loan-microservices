@@ -1,0 +1,112 @@
+version: "3.8"
+networks:
+  app-network:
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports: ["2181:2181"]
+    networks:
+      - app-network
+  kafka:
+    image: confluentinc/cp-kafka:7.4.1
+    depends_on: [zookeeper]
+    hostname: kafka
+    container_name: kafka
+    environment:
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+    ports: ["9092:9092"]
+    networks:
+      - app-network
+
+  pg_loan_core:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${PG_LOAN_USER:-loan}
+      POSTGRES_PASSWORD: ${PG_LOAN_PASSWORD:-loanpass}
+      POSTGRES_DB: ${PG_LOAN_DB:-loan_core}
+    ports: ["5432:5432"]
+    volumes:
+      - pg_loan_core_data:/var/lib/postgresql/data
+
+  pg_kyc:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${PG_KYC_USER:-kyc}
+      POSTGRES_PASSWORD: ${PG_KYC_PASSWORD:-kycpass}
+      POSTGRES_DB: ${PG_KYC_DB:-kyc}
+    ports: ["5433:5432"]
+    volumes:
+      - pg_kyc_data:/var/lib/postgresql/data
+
+  # Application services
+  loan-core:
+    build: ./services/loan-core
+    depends_on: [kafka, pg_loan_core]
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - PG_LOAN_HOST=pg_loan_core
+    ports:
+      - "3001:3000"
+
+  kyc:
+    build: ./services/kyc
+    depends_on: [kafka]
+    environment:
+      - KAFKA_BROKER=kafka:9092
+
+  credit:
+    build: ./services/credit
+    depends_on: [kafka]
+    environment:
+      - KAFKA_BROKER=kafka:9092
+
+  risk:
+    build: ./services/risk
+    depends_on: [kafka]
+    environment:
+      - KAFKA_BROKER=kafka:9092
+
+  blacklist:
+    build: ./services/blacklist
+    depends_on: [kafka]
+    environment:
+      - KAFKA_BROKER=kafka:9092
+
+  audit: 
+    image: loan-microservices-audit:latest 
+    depends_on: [kafka]
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - AUDIT_HTTP_PORT=3010
+    volumes:
+      - ./audit_logs:/app/audit_logs
+    ports:
+    - "3010:3010"
+    networks:
+      - app-network 
+
+  api-gateway:
+    build: ./services/api-gateway
+    depends_on:
+      - loan-core
+      - audit
+    environment:
+      - LOAN_CORE_URL=http://loan-core:3000
+      - AUDIT_URL=http://audit:3010
+    ports:
+      - "3000:3000"
+    networks:
+      - app-network
+
+volumes:
+  pg_loan_core_data:
+  pg_kyc_data:
+  
+ 

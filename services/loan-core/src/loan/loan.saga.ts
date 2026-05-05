@@ -1,70 +1,74 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { createKafkaClient }  from '../common/kafka.provider';
 import { v4 as uuid } from 'uuid';
-import type { Producer } from 'kafkajs';
+import type { Producer, Consumer } from 'kafkajs';
 
 @Injectable()
-export class LoanSaga {
+export class LoanSaga implements OnModuleInit, OnModuleDestroy {
   private logger = new Logger('LoanSaga');
   private kafkaBroker = process.env.KAFKA_BROKER || 'kafka:9092';
   private kafkaProducer!: Producer;
+  private kafkaConsumer!: Consumer;
+  private pendingRequests = new Map<string, { resolve: Function; reject: Function; timer: NodeJS.Timeout }>();
 
-  constructor() {
+  async onModuleInit() {
     const kafka = createKafkaClient([this.kafkaBroker]);
-    // lazy init producer
-    (async () => {
-      const kp = await import('../common/kafka.provider');
-      this.kafkaProducer = await kp.createProducer(kafka);
-    })().catch(err => this.logger.error(err));
+    const kp = await import('../common/kafka.provider');
+
+    this.kafkaProducer = await kp.createProducer(kafka);
+
+    // Create a persistent consumer group for loan-core responses
+    const groupId = `loan-core-saga-${uuid()}`; 
+    this.kafkaConsumer = await kp.createConsumer(kafka, groupId);
+
+    const topics = ['kyc.completed', 'credit.checked', 'risk.checked', 'blacklist.checked'];
+    for (const topic of topics) {
+      await this.kafkaConsumer.subscribe({ topic, fromBeginning: false });
+    }
+
+    await this.kafkaConsumer.run({
+      eachMessage: async ({ topic, message }) => {
+        const applicationId = message.key?.toString();
+        if (!applicationId) return;
+
+        const eventKey = `${topic}:${applicationId}`;
+        const pending = this.pendingRequests.get(eventKey);
+
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingRequests.delete(eventKey);
+          try {
+            const payload = JSON.parse(message.value!.toString());
+            pending.resolve(payload);
+          } catch (err) {
+            pending.reject(err);
+          }
+        }
+      }
+    });
+    this.logger.log('LoanSaga persistent consumer initialized and listening to events');
   }
 
-  private async waitForEvent(topic: string, applicationId: string, timeoutMs = 15000): Promise<any> {
-    const kafka = createKafkaClient([this.kafkaBroker]);
-    const groupId = `saga-waiter-${uuid()}`;
-    const kp = await import('../common/kafka.provider');
-    const consumer = await kp.createConsumer(kafka, groupId);
-    await consumer.subscribe({ topic, fromBeginning: false });
+  async onModuleDestroy() {
+    if (this.kafkaProducer) await this.kafkaProducer.disconnect();
+    if (this.kafkaConsumer) await this.kafkaConsumer.disconnect();
+  }
 
+  private waitForEvent(topic: string, applicationId: string, timeoutMs = 20000): Promise<any> {
+    const eventKey = `${topic}:${applicationId}`;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(async () => {
-        try {
-          await consumer.disconnect();
-        } catch {}
+      const timer = setTimeout(() => {
+        this.pendingRequests.delete(eventKey);
         reject(new Error(`Timeout waiting for ${topic} for ${applicationId}`));
       }, timeoutMs);
 
-      consumer.run({
-        eachMessage: async ({ message }) => {
-          const key = message.key?.toString();
-          if (key !== applicationId) return;
-          try {
-            const payload = JSON.parse(message.value!.toString());
-            clearTimeout(timer);
-            await consumer.disconnect();
-            resolve(payload);
-          } catch (err) {
-            clearTimeout(timer);
-            await consumer.disconnect();
-            reject(err);
-          }
-        }
-      }).catch(async err => {
-        clearTimeout(timer);
-        try { await consumer.disconnect(); } catch {}
-        reject(err);
-      });
+      this.pendingRequests.set(eventKey, { resolve, reject, timer });
     });
   }
 
   async execute(applyLoanDto: any) {
     const applicationId = applyLoanDto.applicationId || uuid();
 
-    // ensure producer ready (simple retry)
-    let retry = 0;
-    while (!this.kafkaProducer && retry < 20) {
-      await new Promise(r => setTimeout(r, 200));
-      retry++;
-    }
     if (!this.kafkaProducer) throw new Error('Kafka producer not available');
 
     // STEP 1: emit loan.requested
@@ -80,7 +84,6 @@ export class LoanSaga {
       this.logger.log(`KYC result for ${applicationId}: ${kyc.kycStatus}`);
 
       if (kyc.kycStatus !== 'PASSED') {
-        // compensation: cancel
         await this.kafkaProducer.send({
           topic: 'loan.cancelled',
           messages: [{ key: applicationId, value: JSON.stringify({ applicationId, reason: 'KYC_FAILED', cancelledAt: new Date().toISOString() }) }],
@@ -117,7 +120,6 @@ export class LoanSaga {
       this.logger.log(`Blacklist result for ${applicationId}: blacklisted=${blacklist.blacklisted}`);
 
       if (blacklist.blacklisted) {
-        // COMPENSATION: cancel loan, rollback state (simulated), log audit
         await this.kafkaProducer.send({
           topic: 'loan.cancelled',
           messages: [{ key: applicationId, value: JSON.stringify({ applicationId, reason: 'BLACKLISTED', cancelledAt: new Date().toISOString() }) }],
@@ -145,7 +147,7 @@ export class LoanSaga {
       });
 
       return { applicationId, status: 'APPROVED' };
-    } catch (err) {
+    } catch (err: any) {
       this.logger.error(`Saga error for ${applicationId}: ${err.message || err}`);
       // best-effort compensation
       await this.kafkaProducer.send({

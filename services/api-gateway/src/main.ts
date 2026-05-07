@@ -1,7 +1,8 @@
- import express, { Request, Response } from 'express';
+import express, { Request, Response } from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import axios from 'axios';
+import rateLimit from 'express-rate-limit';
 
 // ==============================
 // CONFIG
@@ -32,6 +33,48 @@ const log = (msg: string, meta?: any) => {
     ...meta
   }));
 };
+
+// ==============================
+// RATE LIMITING
+// ==============================
+// Global limiter: berlaku untuk SEMUA endpoint
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 menit
+  max: 30,             // maks 30 request per IP per menit
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many requests',
+    message: 'Batas request tercapai. Coba lagi dalam 1 menit.',
+    retryAfter: 60
+  },
+  handler: (req, res, _next, options) => {
+    log('Rate limit exceeded', { ip: req.ip, path: req.path });
+    res.status(429).json(options.message);
+  }
+});
+
+// Loan Apply limiter: lebih ketat, khusus endpoint pengajuan pinjaman
+const loanApplyLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 menit
+  max: 5,              // maks 5 pengajuan loan per IP per menit
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many loan requests',
+    message: 'Terlalu banyak pengajuan pinjaman. Coba lagi dalam 1 menit.',
+    retryAfter: 60
+  },
+  handler: (req, res, _next, options) => {
+    log('Loan apply rate limit exceeded', { ip: req.ip });
+    res.status(429).json(options.message);
+  }
+});
+
+app.use(globalLimiter);                        // apply global ke semua route
+app.use('/api/loans/apply', loanApplyLimiter); // apply ekstra limit ke loan apply
+
+
 
 // ==============================
 // LOAD BALANCER (ROUND ROBIN)
